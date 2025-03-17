@@ -1,0 +1,520 @@
+---
+title: "Neural activity data analysis and prediction model design "
+author: "Tingwei Zhang"
+date: "03/17/2025"
+---
+Abstract:
+This project aims to predict the suucess rate of mice in decision-making task by organizing behavioral and neural data from different sessions. I firstly perform exploratory analysis across all sessions. From this step, I found some key variables such as left contrast (contrast_left), right contrast (contrast_right), and feedback type (feedback_type), and I calculate there unique feature like contrast difference (contrast_diff) and binary success indicators (success) based on those feature. I also
+extract the early average firing rate (early_avg_spike) and late average firing rate (late_avg_spike) from the neural firing matrix of each trial to detect neural activity. Second part is about data integration, I combined all the data into a data frame and standardize each numerical feature. Next, I conduct principal component analysis (PCA) to reduce dimensionality to reveal low-dimensional structures shared across trials and evaluate similarities and differences between different sessions. Lastly, I will use XGBoost model to train and predict on the combined dataset and evaluate the model performance using 100 random trials in Session 1 and 18. 
+
+Introduction
+
+In this project, I will analyze and predict neural activity data in mice using the loaded data. The project is divided into four main sections. First, I will perform exploratory data analysis to find out the data structure, compare neural activity across experiments, and examine variability among mice and sessions. Next, I will integrate the data across experiments by normalizing information, ensuring the dataset is well organized. Then, I will construct predictive models with cross-validation, testing model performance on feedback types using data from select sessions. Finally, I will discuss the results, identify limitations, and improvements.
+```{r}
+library(ggplot2)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(readr)
+library(factoextra)
+```
+
+```{r}
+session <- list()  
+for(i in 1:18){
+session[[i]]=readRDS(paste('./Downloads/STA141AProject/Data/session',i,'.rds',sep=''))}
+summary(session[[1]])
+summary(session[[8]])
+```
+```{r}
+stats <- data.frame()
+for (i in 1:18) {
+  feedback_type <- session[[i]]$feedback_type
+  contrast_left <- session[[i]]$contrast_left
+  contrast_right <- session[[i]]$contrast_right
+  spks <- session[[i]]$spks
+  date <- session[[i]]$date_exp
+  mouse_name <- session[[i]]$mouse_name[1]
+  success_count <- sum(feedback_type == 1, na.rm = TRUE)
+  failure_count <- sum(feedback_type == -1, na.rm = TRUE)
+  success_rate <- success_count / length(feedback_type)
+  neuron_count <- ifelse(is.list(spks), nrow(spks[[1]]), NA)
+
+  session_summary <- data.frame(
+    session_id = i,
+    mouse_name = mouse_name,
+    date = unique(date), 
+    neuron_count = neuron_count,
+    trial_count = length(feedback_type),
+    mean_contrast_left = mean(contrast_left, na.rm = TRUE),
+    mean_contrast_right = mean(contrast_right, na.rm = TRUE),
+    success_count = success_count,
+    failure_count = failure_count,
+    success_rate = success_rate
+  )
+ stats <- rbind(stats, session_summary)
+}
+print(head(stats))
+```
+(I) Describe the data structures across sessions
+```{r}
+neuron_data <- tibble(
+  Session_ID = character(),Mouse_name = character(),Neuron_Count = numeric(),Trials_Count = numeric(),Success_Count = numeric(),Ave_ConL = numeric(),Ave_ConR = numeric(),Avg_Spikes = numeric())
+
+for (i in seq_along(session)) {
+  current_session <- session[[i]]
+  
+  neuron_data <- neuron_data %>%
+    add_row(
+      Session_ID = paste("Session", i),
+      Mouse_name = current_session$mouse_name,
+      Neuron_Count = length(current_session$brain_area),
+      Trials_Count = length(current_session$feedback_type),
+      Success_Count = sum(current_session$feedback_type == 1),
+      Ave_ConL = mean(current_session$contrast_left),
+      Ave_ConR = mean(current_session$contrast_right),
+      Avg_Spikes = mean(sapply(current_session$spks, function(spks) mean(rowSums(spks))))
+    )
+}
+
+str(neuron_data)
+summary(neuron_data)
+
+```
+
+```{r}
+ggplot(stats, aes(x = factor(session_id), y = neuron_count, fill = mouse_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Neuron Count per Session",
+       x = "Session ID", y = "Neuron Count") +
+  theme_minimal()
+ggplot(stats, aes(x = factor(session_id), y = trial_count, fill = mouse_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Trial Count per Session",
+       x = "Session ID", y = "Trial Count") +
+  theme_minimal()
+```
+```{r}
+ggplot(stats, aes(x = session_id, y = success_rate, color = mouse_name)) +
+  geom_line() +
+  geom_point(size = 2) +
+  labs(title = "Success Rate per Session",
+       x = "Session ID", y = "Success Rate") +
+  theme_minimal()
+```
+Variables:
+Session_ID (chr) – A text label indicating the session number (e.g., "Session 1").
+Mouse_name (chr) – Identifies which mouse (e.g., "Cori", "Forsmann") was involved in the session.
+Trials_Count (num) – The total number of trials conducted during that session (ranging from 170 to 1769).
+Success_Count (num) – The number of successful trials (minimum observed is 72, maximum is 752).
+Ave_Count (num) – An average count metric (possibly average correct responses or another measure), typically ranging from about 7.2 to 9.7.
+Ave_ConR (num) – Another average measure (e.g., average contrast or conditioned response), ranging from 122 to 277.
+Neuron_Count (num) – The number of neurons recorded in that session, from 12 up to 24.
+Avg_Spikes (num) – The average spike rate or pulses measured, ranging roughly from 0.66 to 2.46.
+
+I load the data first and check if there is any missing value. I then look into the variables in the session, focusing on neuron count, number of trials, and success rate. The bar graphs I created show how these variables difference between sessions and the line graph indicated how the success rate differed between sessions for each mouse.From the line graph, I can sessions like session 3 had more neurons recorded, means a higher density of neuronal data within all the sessions. The trial count graph stated that how many trials each session had, with some session like session 10 and 13, having more trails. Lastly, the success rate graph shows that each mice had different performance, for example, Lederberg have higher success rates in later sessionsm but Cori had lower success rates but improved over time.
+
+
+(II) Explore the neural activities during each trial
+```{r}
+random_numbers <- sort(sample(seq_along(session[[1]][["spks"]]), 3, replace = TRUE))
+for (i in seq_along(random_numbers)) {
+  spks_data <- as.data.frame(session[[1]][["spks"]][[random_numbers[i]]])
+  matplot(spks_data, type = "l",
+          col = 1:ncol(spks_data),
+          lty = 1,
+          xlab = "Index (Time Bins or Other)",
+          ylab = "Spike Value",
+          main = paste("Trial", random_numbers[i], "Spiking Data"))
+}
+
+```
+III Explore the changes across trials
+
+
+```{r}
+trial_symmetry <- data.frame()
+for (i in 1:18) {
+  contrast_left <- session[[i]]$contrast_left
+  contrast_right <- session[[i]]$contrast_right
+  feedback_type <- session[[i]]$feedback_type
+  contrast_diff <- abs(contrast_left - contrast_right)
+  session_trials <- data.frame(
+    session_id = i,
+    trial_id = 1:length(contrast_diff),
+    mouse_name = session[[i]]$mouse_name[1],
+    contrast_diff = contrast_diff,
+    feedback_type = feedback_type
+  )
+  trial_symmetry <- rbind(trial_symmetry, session_trials)
+}
+trial_symmetry
+
+
+```
+```{r}
+ggplot(trial_symmetry, aes(x = factor(session_id), y = contrast_diff, fill = factor(session_id))) +
+  geom_violin(trim = FALSE) +
+  labs(
+    title = "Violin Plot of Contrast Difference by Session",
+    x = "Session ID",
+    y = "Contrast Difference",
+    fill = "Session ID"
+  ) +
+  theme_minimal()
+```
+```{r}
+ggplot(trial_symmetry, aes(x = contrast_diff, fill = as.factor(feedback_type))) +
+  geom_histogram(binwidth = 0.1, position = "dodge", color = "black") +
+  labs(title = "Histogram: Contrast Difference by Feedback Type",
+       x = "Contrast Difference",
+       y = "Count",
+       fill = "Feedback Type") +
+  scale_fill_manual(values = c("1" = "blue", "-1" = "red"),
+                    labels = c("Success", "Failure")) +
+  theme_minimal()
+
+```
+I firstly by looking for the spiking data from the trials-90, 106, and 113, so I can know the changes in each of them. In those plot, y represents the spike value for each neuron and I can tell how dense the spikes changes and if there is a trend in each trial.Moreover, I combined the data from all the seesions and put it ito a data frame. Besides that I also extracting few features like contrast_left, contrast_right, and feedback_type from each trial, then I calculating the absolute difference between left and right contrasts. 
+
+To further understand the distribution of contrast difference across sessions, I created a violin plot. Each violin means the density of contrast differences within that session. The violin plot allows me to detect which sessions have higher or lower contrast differences and how spread of each session. Let's say session 1, it is tall and narrow, that means it has contrast differences that are both wide-ranging but not extremely frequent. Meanwhile, a shorter, broader violin like session 10 suggest the data are concentrated around a range contrast difference.
+
+Lastly, I plot a histogram of contrast differences split by feedback type. In the historgram, the x axis means the absolute difference in contrast and y axis is the number of trials. From the chart, I can see that there are more failures than success, but there are certain ranges—especially higher contrast differences—where successes become more common. This means that trials with low or very high contrast differences might result different behavioral outcomes.
+
+(iv) explore homogeneity and heterogeneity across sessions and mice
+
+```{r}
+trial_symmetry <- trial_symmetry %>%
+  mutate(success = ifelse(feedback_type == 1, 1, 0))
+session_summary <- trial_symmetry %>%
+  group_by(session_id) %>%
+  summarise(
+    num_trials = n(),
+    success_rate = mean(success),
+    mean_contrast_diff = mean(contrast_diff),
+    sd_contrast_diff = sd(contrast_diff)
+  )
+session_summary
+
+mouse_summary <- trial_symmetry %>%
+  group_by(mouse_name) %>%
+  summarise(
+    num_trials = n(),
+    success_rate = mean(success),
+    mean_contrast_diff = mean(contrast_diff),
+    sd_contrast_diff = sd(contrast_diff)
+  )
+mouse_summary
+
+```
+```{r}
+# Success rate by mouse
+ggplot(mouse_summary, aes(x = mouse_name, y = success_rate)) +
+  geom_bar(stat = "identity", fill = "darkgreen") +
+  labs(title = "Success Rate by Mouse",
+       x = "Mouse Name",
+       y = "Success Rate") +
+  theme_minimal()
+
+# Mean contrast difference by mouse
+ggplot(mouse_summary, aes(x = mouse_name, y = mean_contrast_diff)) +
+  geom_bar(stat = "identity", fill = "purple") +
+  labs(title = "Mean Contrast Difference by Mouse",
+       x = "Mouse Name",
+       y = "Mean Contrast Difference") +
+  theme_minimal()
+```
+From the analysis, I found commonalities and differences across sessions and mice. I see that, overall, all mice tended to have success rates between 0.6 and 0.8, suggesting that baseline performance levels were comparable across all mice. However, when I broke down the data by mouse, I noticed that Lederberg had higher success rates (around 0.76) and Forssmann had lower average contrast differences (around 0.33) than the other mice. Meanwhile, Cori and Hench had ok success rates and contrast differences, with success rates around 0.63-0.68 and contrast differences close to 0.43. At the session level, I observed fluctuations in both trial number and success rate; for example, some sessions (e.g., 10 and 12) had higher success rates (over 0.73) while other sessions had slightly lower performance (around 0.64-0.69). Despite these variations, the overall range of contrast differences remained relatively stable (between 0.39 and 0.47).
+
+3 Data integration
+(i) extracting the shared patters across sessions and
+```{r}
+compute_early_late_spike <- function(spike_matrix) {
+  spike_matrix[is.na(spike_matrix)] <- 0
+  n_time_bins <- ncol(spike_matrix)
+  n_neurons   <- nrow(spike_matrix)
+  early_bins <- 1:(n_time_bins %/% 2)
+  late_bins  <- ((n_time_bins %/% 2) + 1):n_time_bins
+  early_avg_spike <- mean(spike_matrix[, early_bins], na.rm = TRUE)
+  late_avg_spike  <- mean(spike_matrix[, late_bins], na.rm = TRUE)
+  
+  c(early_avg_spike = early_avg_spike,
+    late_avg_spike  = late_avg_spike)
+}
+integrated_data <- data.frame()
+
+for (i in 1:18) {
+  session_i <- session[[i]]
+  nTrials <- length(session_i$spks)
+  session_df <- data.frame(
+    session_id    = i,
+    trial_id      = 1:nTrials,
+    mouse_name    = session_i$mouse_name[1],
+    contrast_left = session_i$contrast_left,
+    contrast_right= session_i$contrast_right,
+    feedback_type = session_i$feedback_type
+  )
+  session_df$contrast_diff <- abs(session_i$contrast_left - session_i$contrast_right)
+  session_df$success       <- ifelse(session_i$feedback_type == 1, 1, 0)
+  spike_features <- lapply(session_i$spks, compute_early_late_spike)
+  spike_features_df <- do.call(rbind, spike_features)
+  session_df$early_avg_spike <- spike_features_df[, "early_avg_spike"]
+  session_df$late_avg_spike  <- spike_features_df[, "late_avg_spike"]
+  integrated_data <- rbind(integrated_data, session_df)
+}
+head(integrated_data)
+
+```
+I confirmed that all sessions share key variables (contrast_left, contrast_right, feedback_type, spks, and mouse_name) and computed derived features such as contrast_diff and success. This ensures a consistent set of variables across all sessions. I also merged the trial-level data from each session into one unified data frame. This integrated dataset now allows me to compare trials from different sessions directly.
+```{r}
+integrated_trial_data <- integrated_data
+numeric_features <- c("trial_id", "contrast_diff", "early_avg_spike", "late_avg_spike")
+integrated_trial_data_scaled <- integrated_trial_data
+integrated_trial_data_scaled[numeric_features] <- scale(integrated_trial_data[numeric_features])
+summary(integrated_trial_data_scaled[numeric_features])
+```
+```{r}
+library(zoo)
+all_trial_summary <- integrated_trial_data %>%
+  mutate(avg_spike_rate = if("early_avg_spike" %in% names(.)) {
+           (early_avg_spike + late_avg_spike) / 2
+         } else {
+           NA
+         }) %>%
+  group_by(session_id) %>%
+  arrange(trial_id) %>%
+  mutate(running_success = rollmean(success, k = 10, fill = NA, align = "right")) %>%
+  ungroup()
+str(all_trial_summary)
+head(all_trial_summary)
+```
+
+I standardized the numeric features (trial_id and contrast_diff) so that differences across sessions are normalized. 
+```{r}
+pca_data <- all_trial_summary %>%
+  select(contrast_diff, avg_spike_rate, running_success)
+cat("Dimensions of pca_data (before filtering):", dim(pca_data), "\n")
+colSums(is.na(pca_data))
+pca_data_noNA <- na.omit(pca_data)
+cat("Dimensions of pca_data_noNA (after na.omit):", dim(pca_data_noNA), "\n")
+variance_vals <- apply(pca_data_noNA, 2, var, na.rm = TRUE)
+cat("Variance of each column:\n")
+print(variance_vals)
+zero_var_cols <- names(variance_vals)[variance_vals == 0 | is.na(variance_vals)]
+
+pca_result <- prcomp(scale(pca_data_noNA), center = TRUE, scale. = TRUE)
+summary(pca_result)
+complete_idx <- complete.cases(pca_data)
+session_id_noNA <- all_trial_summary$session_id[complete_idx]
+mouse_name_noNA <- all_trial_summary$mouse_name[complete_idx]
+pca_scores <- as.data.frame(pca_result$x)
+pca_scores$session_id <- session_id_noNA
+pca_scores$mouse_name <- mouse_name_noNA
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = factor(session_id))) +
+  geom_point(alpha = 0.7) +
+  labs(title = "PCA (by Session)",
+       x = "PC1", y = "PC2", color = "Session ID") +
+  theme_minimal()
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = mouse_name)) +
+  geom_point(alpha = 0.7) +
+  labs(title = "PCA (by Mouse)",
+       x = "PC1", y = "PC2", color = "Mouse Name") +
+  theme_minimal()
+```
+
+I performed PCA on the standardized numeric features. PCA helps me reduce the dimensionality of my data while capturing the main patterns. By visualizing the PCA biplot, I can see how trials from different sessions cluster in a lower-dimensional space and which variables (contrast_diff, trial_id) drive that variance.
+
+At this point, I've built an integrated trial-level dataset that contains a consistent set of features across all 18 sessions. Specifically, for each trial I have:
+
+session_id: The identifier for each session.
+trial_id: The trial number within that session.
+mouse_name: The identifier for the mouse in that session.
+contrast_left: The contrast value for the left stimulus.
+contrast_right: The contrast value for the right stimulus.
+feedback_type: The raw behavioral feedback (e.g., 1 for success, –1 for failure).
+contrast_diff: The absolute difference between contrast_left and contrast_right, a derived feature capturing stimulus difference.
+success: A binary variable (1 for success, 0 for failure) derived from feedback_type.
+spks: The neural data (spike recordings) for that trial, typically stored as a matrix (neurons × time bins).
+Additionally, if I have extracted further neural features, they include:
+overall_avg_spike: The overall average spike rate across all neurons and time bins.
+early_avg_spike: The average spike rate in the early half of the trial.
+late_avg_spike: The average spike rate in the later half of the trial.
+spike_sd: The standard deviation of the spike counts.
+```{r}
+integrated_trial_data <- data.frame()
+
+for (i in 1:18) {
+  session_i <- session[[i]]    # your session list
+  nTrials <- length(session_i$spks)
+  
+  # Build a data frame for each session
+  session_df <- data.frame(
+    session_id    = i,
+    trial_id      = 1:nTrials,
+    mouse_name    = session_i$mouse_name[1],
+    contrast_left = session_i$contrast_left,
+    contrast_right= session_i$contrast_right,
+    feedback_type = session_i$feedback_type
+  )
+  
+  # Derived features
+  session_df$contrast_diff <- abs(session_df$contrast_left - session_df$contrast_right)
+  session_df$success <- ifelse(session_df$feedback_type == 1, 1, 0)
+  
+   
+   spike_features <- lapply(session_i$spks, compute_early_late_spike)
+   spike_features_df <- do.call(rbind, spike_features)
+   session_df$early_avg_spike <- spike_features_df[, "early_avg_spike"]
+   session_df$late_avg_spike  <- spike_features_df[, "late_avg_spike"]
+  
+  # Combine into integrated data
+  integrated_trial_data <- rbind(integrated_trial_data, session_df)
+}
+
+# Now integrated_trial_data is defined. You can glance at it:
+head(integrated_trial_data)
+```
+
+Part 3 Modeling
+```{r}
+library(xgboost)
+library(caret)
+library(pROC)
+features <- c("trial_id", "contrast_left", "contrast_right", "contrast_diff", 
+              "early_avg_spike", "late_avg_spike")
+set.seed(141)  
+test_data_subset <- integrated_trial_data[integrated_trial_data$session_id %in% 2:17, ]
+set.seed(141)
+val_indices <- createDataPartition(integrated_trial_data$success, p = 0.2, list = FALSE)
+validation_data <- integrated_trial_data[val_indices, ]
+internal_train_data <- integrated_trial_data[-val_indices, ]
+train_means <- sapply(internal_train_data[, features], mean, na.rm = TRUE)
+train_sds   <- sapply(internal_train_data[, features], sd, na.rm = TRUE)
+internal_train_data_scaled <- internal_train_data
+for (f in features) {
+  internal_train_data_scaled[[f]] <- (internal_train_data_scaled[[f]] - train_means[f]) / train_sds[f]
+}
+validation_data_scaled <- validation_data
+for (f in features) {
+  validation_data_scaled[[f]] <- (validation_data_scaled[[f]] - train_means[f]) / train_sds[f]
+}
+test1_indices <- sample(which(integrated_trial_data$session_id == 1), 100)
+test2_indices <- sample(which(integrated_trial_data$session_id == 18), 100)
+
+test1_data <- integrated_trial_data[test1_indices, ]
+test2_data <- integrated_trial_data[test2_indices, ]
+
+train_indices <- setdiff(1:nrow(integrated_trial_data), c(test1_indices, test2_indices))
+train_data <- integrated_trial_data[train_indices, ]
+```
+I start by loading the libraries and then define the feature set that I want to include in my model. In my case, I’m using both behavioral features (trial_id, contrast_left, contrast_right, contrast_diff) and neural features (early_avg_spike, late_avg_spike). Then, I split my integrated data into two test sets and one training set. I randomly select 100 trials from Session 1 and 100 trials from Session 18 as my test sets, and I use all remaining trials as my training data.
+
+Prepare Data for Modeling
+```{r}
+train_X <- as.matrix(train_data[, features])
+train_y <- train_data$success
+test1_X <- as.matrix(test1_data[, features])
+test1_y <- test1_data$success
+test2_X <- as.matrix(test2_data[, features])
+test2_y <- test2_data$success
+train_X <- as.matrix(internal_train_data_scaled[, features])
+train_y <- internal_train_data_scaled$success
+dtrain <- xgb.DMatrix(data = train_X, label = train_y)
+validation_X <- as.matrix(validation_data_scaled[, features])
+validation_y <- validation_data_scaled$success
+dvalid <- xgb.DMatrix(data = validation_X, label = validation_y)
+dtrain <- xgb.DMatrix(data = train_X, label = train_y)
+dtest1 <- xgb.DMatrix(data = test1_X, label = test1_y)
+dtest2 <- xgb.DMatrix(data = test2_X, label = test2_y)
+```
+I then extract my feature columns from the training and test sets, converting them into matrices, and also extract the binary labels (success) that represent the outcome.
+
+Train the XGBoost Model
+```{r}
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "error",
+  max_depth = 3,
+  eta = 0.1,
+  nthread = 2
+)
+
+set.seed(141)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 50,  
+  watchlist = list(train = dtrain),
+  verbose = 0
+)
+# Make Predictions on the Test Sets:
+predictions_test1 <- predict(xgb_model, dtest1)
+predictions_test2 <- predict(xgb_model, dtest2)
+predictions_valid <- predict(xgb_model, dvalid)
+predicted_labels_test1 <- ifelse(predictions_test1 > 0.5, 1, 0)
+predicted_labels_test2 <- ifelse(predictions_test2 > 0.5, 1, 0)
+predicted_labels_valid <- ifelse(predictions_valid > 0.5, 1, 0)
+```
+
+Evaluate the Test Data Result
+```{r}
+# Evaluate the Model:
+accuracy_test1 <- mean(predicted_labels_test1 == test1_y)
+cat("Test Set 1 Accuracy:", accuracy_test1, "\n")
+conf_matrix_test1 <- confusionMatrix(as.factor(predicted_labels_test1), as.factor(test1_y))
+print("Test Set 1 Confusion Matrix:")
+print(conf_matrix_test1$table)
+roc_test1 <- roc(test1_y, predictions_test1)
+cat("Test Set 1 AUROC:", auc(roc_test1), "\n")
+accuracy_test2 <- mean(predicted_labels_test2 == test2_y)
+cat("Test Set 2 Accuracy:", accuracy_test2, "\n")
+conf_matrix_test2 <- confusionMatrix(as.factor(predicted_labels_test2), as.factor(test2_y))
+print("Test Set 2 Confusion Matrix:")
+print(conf_matrix_test2$table)
+roc_test2 <- roc(test2_y, predictions_test2)
+cat("Test Set 2 AUROC:", auc(roc_test2), "\n")
+```
+
+
+I first built an XGBoost model using the behavioral and neural features I designed, including contrast differences and early vs. late spike rates. I trained the model on all sessions except for two test sets extracted from sessions 1 and 18. I then evaluated the trained model on these two test sets to measure its ability to predict success or failure.
+
+For test set 1, the model achieved an accuracy of 0.527, indicating that slightly more than half of the predictions matched the actual results. I also calculated the AUROC (area under the ROC curve), which reached 0.7559, indicating that the model has a ok ability to distinguish between successful and failed trials.
+
+Meanwhile, for test set 2, the model performed better, achieving an accuracy of 0.77. I noticed that the AUROC for this test set was 0.667, which perform better than test set 1. The confusion matrix for test set 2 also shows that the classification is more correct overall. 
+```{r}
+accuracy_valid <- mean(predicted_labels_valid == validation_y)
+cat("Validation Accuracy (Sessions 2-17):", accuracy_valid, "\n")
+conf_matrix_valid <- confusionMatrix(as.factor(predicted_labels_valid), as.factor(validation_y))
+cat("Validation Confusion Matrix:\n")
+print(conf_matrix_valid$table)
+roc_valid <- roc(validation_y, predictions_valid)
+cat("Validation AUROC:", auc(roc_valid), "\n")
+```
+
+Discussion:
+
+My goal in this project was to predict the success rate of mice in a visual decision-making task by integrating and analyzing data from 18 sessions. In Part 1, I performed exploratory analyses to understand the raw behavioral and neural data, extracted key variables like contrast_left, contrast_right, and feedback_type, and find other features like contrast_diff. I also calculated the spike data on a trial-by-trial basis to see patterns of neural activity. For Part 2, I focused on data integration by identifying shared features across all sessions and combined trial-level data into a single dataset, also I calculated other neural features like early_avg_spike and late_avg_spike from the spike matrix. Besides that I  standardized numerical variables to mitigate session-specific differences, and PCA  to discover other shared patterns between trials. This step allowed me to assess whether different sessions exhibited common structures or whether they were significantly heterogeneous, which was critical to leverage the benefits between sessions in the modeling part. Finally, in Part 3, I built a prediction model using XGBoost, updated my feature set to include behavioral and neural features, and evaluated its performance on two independent test sets from Session 1 and Session 18. 
+
+The final result stated an accuracy of 72.5%, meaning it correctly classifies approximately three-quarters of the validation dataset. However, the confusion matrix indicated an imbalance in the classification.
+True Negatives (52): The model correctly identified 52 samples as control (0).
+False Negatives (23): The model misclassified 23 actual cases (1) as control (0).
+False Positives (229): The model misclassified 229 actual controls (0) as "cases (1).
+True Positives (647): The model correctly identified 647 samples as case (1).
+The number of false positives (229) is way higher than false negatives (23), which means that the model tends to over-predict the case (1). The AUROC score of 0.6912 indicates that the model has a fair level of discriminative ability.
+
+How to improve the modeling in the future
+The first thing I need to to adjust is the imbalance of false positives, because is might be biased toward predicting the positive class. The other thing I might change is different model like Random Forest logstic regression or tensorflow
+
+Reference:
+
+Steinmetz, N.A., Zatka-Haas, P., Carandini, M. et al. Distributed coding of choice, action and engagement across the mouse brain. Nature 576, 266–273 (2019). https://doi.org/10.1038/s41586-019-1787-x
+https://chatgpt.com/share/67d75dff-410c-8001-b6d2-dc9e3c9167c1
+https://stackoverflow.com/questions/36049316/principal-components-order-pca-in-r
+https://stackoverflow.com/questions/40281021/online-pca-in-r
+https://stackoverflow.com/questions/48610260/the-result-loadings-of-pca-in-r
+https://stackoverflow.com/questions/15376075/cluster-analysis-in-r-determine-the-optimal-number-of-clusters/15376462#15376462
+https://stackoverflow.com/questions/11103189/how-to-find-out-which-package-version-is-loaded-in-r
+https://stackoverflow.com/questions/59194078/how-to-get-accuration-xgboost-in-r
+https://chatgpt.com/share/67d7607e-71bc-8001-9e3a-ad1011d6e1cb
+https://stackoverflow.com/questions/49524744/xgboost-in-r-predict-rare-event-in-r-imbalance-data
+https://chatgpt.com/share/67d88141-9d10-8001-85ec-e59b746aa5d9
